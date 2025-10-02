@@ -1,0 +1,225 @@
+# Logging variables
+$LogDirectory = "C:\script\Logs"
+$LogFilePrefix = "MSSQL_Cloning"
+$startTime = Get-Date -Format "yyyy-MM-dd_HH-mm-ss"
+$logFileName = "$LogFilePrefix`_$startTime.log"
+$logFilePath = Join-Path -Path $LogDirectory -ChildPath $logFileName
+
+# Logging function
+function Write-Log {
+    param (
+        [string]$Message,
+        [switch]$IsError
+    )
+
+    # Log the message
+    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    $logMessage = "$timestamp - $Message"
+    if ($IsError) {
+        $logMessage = "$timestamp - ERROR: $Message"
+    }
+    Write-Output "$logMessage"
+    Add-Content -Path $logFilePath -Value $logMessage
+}
+
+
+# Main Script
+# Clear old log files
+Write-Log "===== Script triggered ====="
+try {
+    Remove-Item -Path "\\domain.com\failed.txt" -Force -ErrorAction Stop
+    Remove-Item -Path "\\domain.com\success.txt" -Force -ErrorAction Stop
+    Write-Log "Old status logs file cleared"
+} catch {
+    Write-Log "Failed to delete old log files: $_"
+}
+
+# Import PowerShell modules
+Import-Module PureStoragePowerShellSDK2
+
+# Declare variables
+$TargetSQLServer = 'SqlServerHostName'
+$ArrayName = 'PureArrayName.domain.com'
+$ProtectionGroupName = 'PG-Clone'
+$PureUser = "Domain\User"
+#$File = "Password.txt"
+$Credential = Import-CliXml -Path "C:\script\cred.xml"
+Write-Log "Required variables decleared"
+
+
+
+$TargetDiskSerialNumbers = @("8A5123A4CA7E12345DC562F", "8A5123A4CA7E12345DC5630", "8A5123A4CA7E12345DC5631", "8A5123A4CA7E12345DC5632", "8A5123A4CA7E12345DC5829", "8A5123A4CA7E12345DC582A", "8A5123A4CA7E12345DC582B", "8A5123A4CA7E12345DC582C")
+$VolumesToCreate = @(
+    @{ TargetVolumeName = "TargetSqlVolume-E-DATAFILES_DB04-33"; SourceVolumeName = "SourceSqlVolume-E-DATAFILES_DB04-26" },
+    @{ TargetVolumeName = "TargetSqlVolume-F-LOGFILES_LOG01-34"; SourceVolumeName = "SourceSqlVolume-F-LOGFILES_LOG01-34" },
+    @{ TargetVolumeName = "TargetSqlVolume-E-DATAFILES_DB03-35"; SourceVolumeName = "SourceSqlVolume-E-DATAFILES_DB03-25" },
+    @{ TargetVolumeName = "TargetSqlVolume-F-LOGFILES_LOG01-36"; SourceVolumeName = "SourceSqlVolume-F-LOGFILES_LOG01-33" },
+    @{ TargetVolumeName = "TargetSqlVolume-E-DATAFILES_DB08-37"; SourceVolumeName = "SourceSqlVolume-E-DATAFILES_DB08-210" },
+    @{ TargetVolumeName = "TargetSqlVolume-F-LOGFILES_LOG01-38"; SourceVolumeName = "SourceSqlVolume-F-LOGFILES_LOG01-38" },
+    @{ TargetVolumeName = "TargetSqlVolume-E-DATAFILES_DB010-39"; SourceVolumeName = "SourceSqlVolume-E-DATAFILES_DB010-212" },
+    @{ TargetVolumeName = "TargetSqlVolume-F-LOGFILES_LOG01-310"; SourceVolumeName = "SourceSqlVolume-F-LOGFILES_LOG01-310" }
+    # Additional volumes as needed
+)
+Write-Log "Target pure volumes serial numbers declared:"
+Write-Log "$TargetDiskSerialNumbers"
+$DatabaseNames = @("DB1","Db2","DB3","DB4","DB5","DB6","DB7","DB9")
+Write-Log "Target DBs declared:"
+Write-Log "$DatabaseNames"
+
+
+# Initialize success flag
+$success = $true
+Write-Log "Pre-script initializations completed"
+
+
+try {
+  
+    # Offline the target databases
+    Write-Log "===== Putting DBs offline ====="
+    foreach ($DBName in $DatabaseNames) {
+        try {
+            
+            Write-Log "Working with $DBName - trying to put offline."
+            $Query = "ALTER DATABASE [$DBName] SET OFFLINE WITH ROLLBACK IMMEDIATE"
+            Invoke-Sqlcmd -ServerInstance $TargetSQLServer -Database master -Query $Query -ErrorAction Stop
+            Write-Log "Set $DBName offline."
+            #Start-Sleep -Seconds 10
+        } catch {
+            Write-Log "Failed to set $DBName offline: $_"
+            $success = $false
+        }
+    }
+
+    Start-Sleep -seconds 10
+
+    Write-Log "===== Verifying DBs are offline ====="
+    try{
+        # Join the array elements into a single string with quotes and commas
+        $DatabaseNamesString =  ($DatabaseNames -join "','") 
+        
+        # Construct the SQL query
+        $Query = "SELECT name, state_desc FROM sys.databases WHERE name IN('$DatabaseNamesString') AND state_desc NOT LIKE '%offline%'"
+        
+        # Run the query
+        $db_status = Invoke-Sqlcmd -ServerInstance $TargetSQLServer -Database master -Query $Query -ErrorAction Stop
+
+        if ($db_status.Count -eq 0){
+            Write-Log "All required DBs are offline. Online DB count is - $($db_status.count)"
+        } else {
+            Write-Log "ERROR !!! NOT ALL required DBs are offline !!! Online DB count is - $($db_status.count)"
+            #Write-Log $db_status
+            #break
+        }
+    } catch {
+        # Write-Log "Some of the DBs are not offline:  $DBName is not offline: $_"
+        # $success = $false
+    }
+
+
+    # Wait for 5 mins after offlining DB.
+    Start-Sleep -seconds 300
+    
+    # Offline the target volumes
+    Write-Log "===== Putting Volumes offline ====="
+    foreach ($SerialNumber in $TargetDiskSerialNumbers) {
+        try {
+            Write-Log "Working with Serial Number $SerialNumber - trying to put it offline."
+            Get-Disk | Where-Object { $_.SerialNumber -eq $SerialNumber } | Set-Disk -IsOffline $True -AsJob -ErrorAction Stop
+            Write-Log "Disk with Serial Number $SerialNumber is now offline."
+            Start-Sleep -Seconds 5
+        } catch {
+            Write-Log "Failed to set disk with Serial Number $SerialNumber offline: $_"
+            $success = $false
+        }
+    }
+
+    # Connect to FlashArray and create a snapshot
+    Write-Log "===== Creating PURE storage snapshots ====="
+    try {
+        $FlashArray = Connect-Pfa2Array -Endpoint $ArrayName -Credential $Credential -IgnoreCertificateError -ErrorAction Stop
+        $Snapshot = New-Pfa2ProtectionGroupSnapshot -Array $FlashArray -SourceName $ProtectionGroupName -ErrorAction Stop
+        Write-Log "Snapshots created."
+    } catch {
+        Write-Log "Failed to create snapshot: $_"
+        $success = $false
+    }
+
+    # Perform volume overwrites
+    Write-Log "===== Overwriting exisiting PURE volumes ====="
+    foreach ($Volume in $VolumesToCreate) {
+        try {
+            $TargetVolumeName = $Volume.TargetVolumeName
+            $SourceVolumeName = $Volume.SourceVolumeName
+            New-Pfa2Volume -Array $FlashArray -Name $TargetVolumeName -SourceName ($Snapshot.Name + "." + $SourceVolumeName) -Overwrite $true -ErrorAction Stop
+            Write-Log "Created volume $TargetVolumeName from snapshot of $SourceVolumeName."
+        } catch {
+            Write-Log "Failed to create volume $TargetVolumeName : $_"
+            $success = $false
+        }
+    }
+
+    Start-Sleep -seconds 10
+
+    # Bring disks back online
+    Write-Log "===== Putting cloned disks on-line ====="
+    foreach ($SerialNumber in $TargetDiskSerialNumbers) {
+        try {
+            Get-Disk | Where-Object { $_.SerialNumber -eq $SerialNumber } | Set-Disk -IsOffline $False -ErrorAction Stop
+            Write-Log "Disk with Serial Number $SerialNumber is now Online."
+        } catch {
+            Write-Log "Failed to bring disk with Serial Number $SerialNumber online: $_"
+            $success = $false
+        }
+    }
+
+    Start-Sleep -Seconds 60
+
+    # Bring databases back online
+    Write-Log "===== Putting DBs on-line ====="
+    foreach ($DBName in $DatabaseNames) {
+        try {
+            $Query = "ALTER DATABASE [$DBName] SET ONLINE WITH ROLLBACK IMMEDIATE"
+            Invoke-Sqlcmd -ServerInstance $TargetSQLServer -Database master -Query $Query -ErrorAction Stop
+
+            
+            Write-Log "Set $DBName Online."
+
+            Start-Sleep -Seconds 5
+        } catch {
+            Write-Log "Failed to set $DBName online: $_"
+            $success = $false
+        }
+    }
+
+    # Cleanup snapshot
+    Write-Log " "
+    try {
+        Remove-Pfa2ProtectionGroupSnapshot -Array $FlashArray -Name $Snapshot.Name -ErrorAction Stop
+    } catch {
+        Write-Log "Failed to remove snapshot: $_"
+        $success = $false
+    }
+
+} catch {
+    Write-Log "Script execution encountered a critical error: $_"
+    $success = $false
+}
+
+# Verify if the required SMB share is accessible
+    try {
+        $share_access = Get-Item "\\Domain.com\"
+    } catch {
+        Write-Log "Failed access the share: $_"
+        $success = $false
+    }
+
+# Create success or failure log file based on the outcome
+if ($success) {
+    New-Item -Path "\\Domain.com\success.txt" -ItemType File -Force
+    Write-Log "Process completed successfully. Created success.txt."
+} else {
+    New-Item -Path "\\Domain.com\failed.txt" -ItemType File -Force
+    Write-Log "Process encountered errors. Created failed.txt."
+}
+
+Write-Log "===== Script finished ====="
